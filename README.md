@@ -37,7 +37,7 @@ You are now connected to database "test" as user "postgres".
 test=# create table bdt as select * from generate_series(1,40000000);
 SELECT 40000000
 
-test=# select * from pg_list_orphaned('test') order by relfilenode;
+test=# select * from pg_list_orphaned() order by relfilenode;
  dbname | path | name | size | mod_time | relfilenode | reloid
 --------+------+------+------+----------+-------------+--------
 (0 rows
@@ -79,7 +79,7 @@ test=# select pg_relation_filepath ('bdtorph');
 ERROR:  relation "bdtorph" does not exist
 LINE 1: select pg_relation_filepath ('bdtorph');
 
-test=# select * from pg_list_orphaned('test') order by relfilenode;
+test=# select * from pg_list_orphaned() order by relfilenode;
  dbname |    path     |   name   |    size    |        mod_time        | relfilenode | reloid
 --------+-------------+----------+------------+------------------------+-------------+--------
  test   | base/294991 | 294997.1 |  376176640 | 2020-05-03 16:18:36+00 |      294997 |      0
@@ -117,7 +117,7 @@ test=# select pg_relation_filepath ('bdtorph');
 ERROR:  relation "bdtorph" does not exist
 LINE 1: select pg_relation_filepath ('bdtorph');
 
-test=# select * from pg_list_orphaned('test') order by relfilenode;
+test=# select * from pg_list_orphaned() order by relfilenode;
  dbname |                  path                   |   name   |    size    |        mod_time        | relfilenode | reloid
 --------+-----------------------------------------+----------+------------+------------------------+-------------+--------
  test   | pg_tblspc/303184/PG_12_201909212/303183 | 303185   | 1073741824 | 2020-05-03 17:28:49+00 |      303185 |      0
@@ -151,7 +151,7 @@ test=# select pg_relation_filepath ('bdtorphtemp');
 ERROR:  relation "bdtorphtemp" does not exist
 LINE 1: select pg_relation_filepath ('bdtorphtemp');
 
-test=# select * from pg_list_orphaned('test') order by relfilenode;
+test=# select * from pg_list_orphaned() order by relfilenode;
  dbname |    path     |    name     |    size    |        mod_time        | relfilenode | reloid
 --------+-------------+-------------+------------+------------------------+-------------+--------
  test   | base/311377 | t4_311380.1 |  376176640 | 2020-05-03 17:35:03+00 |      311380 |      0
@@ -159,24 +159,11 @@ test=# select * from pg_list_orphaned('test') order by relfilenode;
 (2 rows)
 ```
 
-Example 4:
-----------
-```
-orphaned=# select * from pg_list_orphaned() order by relfilenode;
-  dbname  |    path     |  name  | size  |        mod_time        | relfilenode | reloid
-----------+-------------+--------+-------+------------------------+-------------+--------
- orphaned | base/278610 | 286853 |  8192 | 2020-05-03 15:41:00+00 |      286853 |      0
- orphaned | base/278610 | 286856 | 16384 | 2020-05-03 15:41:08+00 |      286856 |      0
- orphaned | base/278610 | 286858 | 16384 | 2020-05-03 15:41:08+00 |      286858 |      0
-(3 rows)
-```
-
 Remarks
 =======
 * double check carefully before taking any actions on those files
-* for files linked to temp tables you need to be connected to the database you want information from: If not, they are not displayed (to avoid false positive)
 * has been tested from version 10 to 12.2
-* if no argument is provided, then pg_list_orphaned does the search for the database it is connected to (see example 4)
+* pg_list_orphaned does the search for the database it is connected to
 
 License
 =======

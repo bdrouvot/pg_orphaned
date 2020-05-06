@@ -1,3 +1,13 @@
+/*-------------------------------------------------------------------------
+ *
+ * pg_orphaned.c
+ *
+ * This program is open source, licensed under the PostgreSQL license.
+ * For license terms, see the LICENSE file.
+ *
+ *-------------------------------------------------------------------------
+ */
+
 #include "postgres.h"
 #include "miscadmin.h"
 #include "access/twophase.h"
@@ -16,6 +26,8 @@
 #else
 #include "catalog/pg_collation_d.h"
 #endif
+#include "storage/lock.h"
+#include "storage/predicate_internals.h"
 
 
 PG_MODULE_MAGIC;
@@ -24,7 +36,14 @@ PG_FUNCTION_INFO_V1(pg_list_orphaned);
 
 List   *list_orphaned_relations=NULL;
 static void pg_list_orphaned_internal(FunctionCallInfo fcinfo);
-static void search_orphaned(List **flist, const char *dbname, const char *dir, Oid reltablespace);
+static void search_orphaned(List **flist, Oid dboid, const char *dbname, const char *dir, Oid reltablespace);
+static bool is_lock_on_relation(Oid database, Oid relation);
+
+typedef struct
+{
+        LockData   *lockData;
+        int        currIdx;
+} Relation_Lock_Status;
 
 typedef struct OrphanedRelation {
 	char	   *dbname;
@@ -36,11 +55,41 @@ typedef struct OrphanedRelation {
 	Oid reloid;
 } OrphanedRelation;
 
+static bool
+is_lock_on_relation(Oid database, Oid relation)
+{
+	Relation_Lock_Status *mystatus;
+	LockData   *lockData;
+
+	mystatus = (Relation_Lock_Status *) palloc(sizeof(Relation_Lock_Status));
+	mystatus->lockData = GetLockStatusData();
+	mystatus->currIdx = 0;
+	lockData = mystatus->lockData;
+
+	while (mystatus->currIdx < lockData->nelements)
+	{
+		LockInstanceData *instance;
+		instance = &(lockData->locks[mystatus->currIdx]);
+		switch ((LockTagType) instance->locktag.locktag_type)
+		{
+			case LOCKTAG_RELATION:
+			case LOCKTAG_RELATION_EXTEND:
+				if (instance->locktag.locktag_field1 == database && instance->locktag.locktag_field2 == relation) {
+					pfree (mystatus);
+					return true;
+				}
+			default:
+				mystatus->currIdx++;
+		}
+	}
+	pfree (mystatus);
+	return false;
+}
+
 Datum
 pg_list_orphaned(PG_FUNCTION_ARGS)
 {
 
-	text *dbNameText = NULL;
 	const char *dbName = NULL;
 	DIR                *dirdesc;
 	struct dirent *direntry;
@@ -52,12 +101,9 @@ pg_list_orphaned(PG_FUNCTION_ARGS)
 	MemoryContext   mctx;
 
 	if (PG_ARGISNULL(0))
-	{
 		dbName=get_database_name(MyDatabaseId);
-	} else {
-		dbNameText = PG_GETARG_TEXT_PP(0);
-		dbName = text_to_cstring(dbNameText);
-	}
+	else
+		elog(ERROR, "has to be used without arguments");
 
 	dbOid = get_database_oid(dbName, false);
 	mctx = MemoryContextSwitchTo(TopMemoryContext);
@@ -67,7 +113,7 @@ pg_list_orphaned(PG_FUNCTION_ARGS)
 
 	/* default tablespace */
 	snprintf(dir, sizeof(dir), "base/%u", dbOid);
-	search_orphaned(&list_orphaned_relations, dbName, dir, 0);
+	search_orphaned(&list_orphaned_relations, dbOid, dbName, dir, 0);
 
 	/* Scan the non-default tablespaces */
 	snprintf(dirpath, MAXPGPATH, "pg_tblspc");
@@ -87,7 +133,7 @@ pg_list_orphaned(PG_FUNCTION_ARGS)
 		reltbsname = strdup(direntry->d_name);
 		reltbsnode = (Oid) strtoul(reltbsname, &reltbsname, 10);
 
-		search_orphaned(&list_orphaned_relations, dbName, dir, reltbsnode);
+		search_orphaned(&list_orphaned_relations, dbOid, dbName, dir, reltbsnode);
 	}
 	FreeDir(dirdesc);
 	MemoryContextSwitchTo(mctx);
@@ -146,7 +192,7 @@ pg_list_orphaned_internal(FunctionCallInfo fcinfo)
 
 
 void
-search_orphaned(List **flist, const char* dbname, const char* dir, Oid reltablespace)
+search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oid reltablespace)
 {
 
 	Oid                     oidrel = InvalidOid;
@@ -186,7 +232,7 @@ search_orphaned(List **flist, const char* dbname, const char* dir, Oid reltables
 			relfilename = strdup(de->d_name);
 			relfilenode = (Oid) strtoul(relfilename, &relfilename, 10);
 			oidrel = RelidByRelfilenode(reltablespace, relfilenode);
-			if (!OidIsValid(oidrel)) {
+			if (!OidIsValid(oidrel) && !is_lock_on_relation(dboid,relfilenode)) {
 				orph->dbname = strdup(dbname);
 				orph->path = strdup(dir);
 				orph->name = strdup(de->d_name);
@@ -204,7 +250,7 @@ search_orphaned(List **flist, const char* dbname, const char* dir, Oid reltables
 		 * so that we check it starts with a t
                  * and then check the format with a regex
 		 */
-		} else if (de->d_name[0] == 't' && get_database_oid(dbname, false) == MyDatabaseId) {
+		} else if (de->d_name[0] == 't') {
 			int i;
 			pg_wchar   *wstr;
 			int        wlen;
@@ -243,7 +289,7 @@ search_orphaned(List **flist, const char* dbname, const char* dir, Oid reltables
 							relfilename = strdup(t);
 							relfilenode = (Oid) strtoul(relfilename, &relfilename, 10);
 							oidrel = RelidByRelfilenode(reltablespace, relfilenode);
-							if (!OidIsValid(oidrel)) {
+							if (!OidIsValid(oidrel) && !is_lock_on_relation(dboid,relfilenode)) {
 								orph->dbname = strdup(dbname);
 								orph->path = strdup(dir);
 								orph->name = strdup(de->d_name);
