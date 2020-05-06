@@ -101,25 +101,19 @@ pg_list_orphaned(PG_FUNCTION_ARGS)
 	struct dirent *direntry;
 	char            dirpath[MAXPGPATH];
 	char            dir[MAXPGPATH + 21 + sizeof(TABLESPACE_VERSION_DIRECTORY)];
-	Oid                     dbOid;
 	Oid                     reltbsnode = InvalidOid;
 	char *reltbsname;
 	MemoryContext   mctx;
 
-	if (PG_ARGISNULL(0))
-		dbName=get_database_name(MyDatabaseId);
-	else
-		elog(ERROR, "has to be used without arguments");
-
-	dbOid = get_database_oid(dbName, false);
+	dbName=get_database_name(MyDatabaseId);
 	mctx = MemoryContextSwitchTo(TopMemoryContext);
 
 	list_free_deep(list_orphaned_relations);
 	list_orphaned_relations=NIL;
 
 	/* default tablespace */
-	snprintf(dir, sizeof(dir), "base/%u", dbOid);
-	search_orphaned(&list_orphaned_relations, dbOid, dbName, dir, 0);
+	snprintf(dir, sizeof(dir), "base/%u", MyDatabaseId);
+	search_orphaned(&list_orphaned_relations, MyDatabaseId, dbName, dir, 0);
 
 	/* Scan the non-default tablespaces */
 	snprintf(dirpath, MAXPGPATH, "pg_tblspc");
@@ -134,12 +128,12 @@ pg_list_orphaned(PG_FUNCTION_ARGS)
 			continue;
 
 		snprintf(dir, sizeof(dir), "pg_tblspc/%s/%s/%u",
-			direntry->d_name, TABLESPACE_VERSION_DIRECTORY, dbOid);
+			direntry->d_name, TABLESPACE_VERSION_DIRECTORY, MyDatabaseId);
 
 		reltbsname = strdup(direntry->d_name);
 		reltbsnode = (Oid) strtoul(reltbsname, &reltbsname, 10);
 
-		search_orphaned(&list_orphaned_relations, dbOid, dbName, dir, reltbsnode);
+		search_orphaned(&list_orphaned_relations, MyDatabaseId, dbName, dir, reltbsnode);
 	}
 	FreeDir(dirdesc);
 	MemoryContextSwitchTo(mctx);

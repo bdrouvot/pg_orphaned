@@ -1,5 +1,4 @@
 CREATE FUNCTION pg_list_orphaned(
-	IN dbname text default null,
 	OUT dbname text,
 	OUT path text,
 	OUT name text,
