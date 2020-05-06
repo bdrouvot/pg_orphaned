@@ -67,7 +67,6 @@ pg_list_orphaned(PG_FUNCTION_ARGS)
 
 	/* default tablespace */
 	snprintf(dir, sizeof(dir), "base/%u", dbOid);
-	ereport(LOG, (errmsg("BDT DIR DEFAULT is %s",dir)));
 	search_orphaned(&list_orphaned_relations, dbName, dir, 0);
 
 	/* Scan the non-default tablespaces */
@@ -240,7 +239,6 @@ search_orphaned(List **flist, const char* dbname, const char* dir, Oid reltables
 					for (i = 0, t = strtok_r(temprel, "_", &tokptr); t != NULL; i++, t = strtok_r(NULL, "_", &tokptr))
 					{
 						if (i == 1) {
-							ereport(LOG, (errmsg("ca match! Je commence par t avec %s et regex res is %d",de->d_name, r)));
 							orph = palloc(sizeof(*orph));
 							relfilename = strdup(t);
 							relfilenode = (Oid) strtoul(relfilename, &relfilename, 10);
