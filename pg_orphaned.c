@@ -55,6 +55,12 @@ typedef struct OrphanedRelation {
 	Oid reloid;
 } OrphanedRelation;
 
+/* Using is_lock_on_relation
+ * to avoid reporting files as orphaned
+ * for relations that are not yet visibles
+ * like not yet committed/rollbacked
+ * or creation in progress
+ */
 static bool
 is_lock_on_relation(Oid database, Oid relation)
 {
