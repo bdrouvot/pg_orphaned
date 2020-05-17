@@ -9,3 +9,8 @@ CREATE FUNCTION pg_list_orphaned(
 RETURNS SETOF RECORD
 AS 'MODULE_PATHNAME','pg_list_orphaned'
 LANGUAGE C VOLATILE;
+
+CREATE FUNCTION pg_remove_orphaned()
+    RETURNS void
+    LANGUAGE c COST 100
+AS 'MODULE_PATHNAME', 'pg_remove_orphaned';

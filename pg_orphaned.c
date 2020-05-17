@@ -21,29 +21,58 @@
 #if PG_VERSION_NUM < 110000
 #include "catalog/pg_collation.h"
 #include "catalog/catalog.h"
-#include "utils/memutils.h"
 #include "utils/timestamp.h"
+#include "utils/memutils.h"
+#include "catalog/pg_tablespace.h"
 #else
 #include "catalog/pg_collation_d.h"
+#include "catalog/pg_tablespace_d.h"
+#include "utils/rel.h"
 #endif
-#include "storage/lock.h"
-#include "storage/predicate_internals.h"
-
+#include "utils/catcache.h"
+#include "utils/fmgroids.h"
+#include "utils/relmapper.h"
+#include "catalog/indexing.h"
+#include "utils/inval.h"
+#if PG_VERSION_NUM >= 120000
+#include "access/table.h"
+#include "access/genam.h"
+#include "utils/snapmgr.h"
+#else
+#include "utils/tqual.h"
+#include "access/htup_details.h"
+#endif
 
 PG_MODULE_MAGIC;
 Datum pg_list_orphaned(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(pg_list_orphaned);
 
+PG_FUNCTION_INFO_V1(pg_remove_orphaned);
+Datum pg_remove_orphaned(PG_FUNCTION_ARGS);
+
 List   *list_orphaned_relations=NULL;
 static void pg_list_orphaned_internal(FunctionCallInfo fcinfo);
 static void search_orphaned(List **flist, Oid dboid, const char *dbname, const char *dir, Oid reltablespace);
-static bool is_lock_on_relation(Oid database, Oid relation);
+static void pg_build_orphaned_list(Oid dbOid);
+static Oid RelidByRelfilenodeDirty(Oid reltablespace, Oid relfilenode);
+
+/* Hash table for information about each relfilenode <-> oid pair */
+static HTAB *RelfilenodeMapHashDirty = NULL;
+
+/* built first time through in InitializeRelfilenodeMap */
+static ScanKeyData relfilenode_skey_dirty[2];
 
 typedef struct
 {
-        LockData   *lockData;
-        int        currIdx;
-} Relation_Lock_Status;
+	Oid                     reltablespace;
+	Oid                     relfilenode;
+} RelfilenodeMapKey;
+
+typedef struct
+{
+	RelfilenodeMapKey key;          /* lookup key - must be first */
+	Oid                     relid;                  /* pg_class.oid */
+} RelfilenodeMapEntry;
 
 typedef struct OrphanedRelation {
 	char	   *dbname;
@@ -55,91 +84,256 @@ typedef struct OrphanedRelation {
 	Oid reloid;
 } OrphanedRelation;
 
-/* Using is_lock_on_relation
- * to avoid reporting files as orphaned
- * for relations that are not yet visibles
- * like not yet committed/rollbacked
- * or creation in progress
+/*
+ *  Flush mapping entries when pg_class is updated in a relevant fashion.
+ *  Same as RelfilenodeMapInvalidateCallback in relfilenodemap.c
  */
-static bool
-is_lock_on_relation(Oid database, Oid relation)
+static void
+RelfilenodeMapInvalidateCallbackDirty(Datum arg, Oid relid)
 {
-	Relation_Lock_Status *mystatus;
-	LockData   *lockData;
+	HASH_SEQ_STATUS status;
+	RelfilenodeMapEntry *entry;
 
-	mystatus = (Relation_Lock_Status *) palloc(sizeof(Relation_Lock_Status));
-	mystatus->lockData = GetLockStatusData();
-	mystatus->currIdx = 0;
-	lockData = mystatus->lockData;
+	/* callback only gets registered after creating the hash */
+	Assert(RelfilenodeMapHashDirty != NULL);
 
-	while (mystatus->currIdx < lockData->nelements)
+	hash_seq_init(&status, RelfilenodeMapHashDirty);
+	while ((entry = (RelfilenodeMapEntry *) hash_seq_search(&status)) != NULL)
 	{
-		LockInstanceData *instance;
-		instance = &(lockData->locks[mystatus->currIdx]);
-		switch ((LockTagType) instance->locktag.locktag_type)
+		/*
+		 * If relid is InvalidOid, signalling a complete reset, we must remove
+		 * all entries, otherwise just remove the specific relation's entry.
+		 * Always remove negative cache entries.
+		 */
+		if (relid == InvalidOid ||      /* complete reset */
+			entry->relid == InvalidOid ||   /* negative cache entry */
+			entry->relid == relid)  /* individual flushed relation */
 		{
-			case LOCKTAG_RELATION:
-			case LOCKTAG_RELATION_EXTEND:
-				if (instance->locktag.locktag_field1 == database && instance->locktag.locktag_field2 == relation) {
-					pfree (mystatus);
-					return true;
-				}
-			default:
-				mystatus->currIdx++;
+			if (hash_search(RelfilenodeMapHashDirty,
+							(void *) &entry->key,
+							HASH_REMOVE,
+							NULL) == NULL)
+						elog(ERROR, "hash table corrupted");
 		}
 	}
-	pfree (mystatus);
-	return false;
+}
+
+/*
+ * Initialize cache, either on first use or after a reset.
+ * Same as InitializeRelfilenodeMap in relfilenodemap.c
+ */
+static void
+InitializeRelfilenodeMapDirty(void)
+{
+	HASHCTL         ctl;
+	int                     i;
+
+	/* Make sure we've initialized CacheMemoryContext. */
+	if (CacheMemoryContext == NULL)
+		CreateCacheMemoryContext();
+
+	/* build skey */
+	MemSet(&relfilenode_skey_dirty, 0, sizeof(relfilenode_skey_dirty));
+
+	for (i = 0; i < 2; i++)
+	{
+		fmgr_info_cxt(F_OIDEQ,
+					&relfilenode_skey_dirty[i].sk_func,
+					CacheMemoryContext);
+		relfilenode_skey_dirty[i].sk_strategy = BTEqualStrategyNumber;
+		relfilenode_skey_dirty[i].sk_subtype = InvalidOid;
+		relfilenode_skey_dirty[i].sk_collation = InvalidOid;
+	}
+
+	relfilenode_skey_dirty[0].sk_attno = Anum_pg_class_reltablespace;
+	relfilenode_skey_dirty[1].sk_attno = Anum_pg_class_relfilenode;
+
+	/* Initialize the hash table. */
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(RelfilenodeMapKey);
+	ctl.entrysize = sizeof(RelfilenodeMapEntry);
+	ctl.hcxt = CacheMemoryContext;
+
+	/*
+	 * Only create the RelfilenodeMapHashDirty now, so we don't end up partially
+	 * initialized when fmgr_info_cxt() above ERRORs out with an out of memory
+	 * error.
+	 */
+	RelfilenodeMapHashDirty =
+		hash_create("RelfilenodeMap cache", 64, &ctl,
+			HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/* Watch for invalidation events. */
+	CacheRegisterRelcacheCallback(RelfilenodeMapInvalidateCallbackDirty,
+									(Datum) 0);
+}
+
+
+/*
+ * Map a relation's (tablespace, filenode) to a relation's oid and cache the
+ * result.
+ *
+ * This is the same as the existing RelidByRelfilenode in relfilenodemap.c but
+ * it is done by using a DirtySnapshot as we want to see relation being created
+ *
+ * Returns InvalidOid if no relation matching the criteria could be found.
+ */
+Oid
+RelidByRelfilenodeDirty(Oid reltablespace, Oid relfilenode)
+{
+	RelfilenodeMapKey key;
+	RelfilenodeMapEntry *entry;
+	bool            found;
+	SysScanDesc scandesc;
+	Relation        relation;
+	HeapTuple       ntp;
+	ScanKeyData skey[2];
+	Oid                     relid;
+	SnapshotData DirtySnapshot;
+
+	InitDirtySnapshot(DirtySnapshot);
+	if (RelfilenodeMapHashDirty == NULL)
+		InitializeRelfilenodeMapDirty();
+
+	/* pg_class will show 0 when the value is actually MyDatabaseTableSpace */
+	if (reltablespace == MyDatabaseTableSpace)
+		reltablespace = 0;
+
+	MemSet(&key, 0, sizeof(key));
+	key.reltablespace = reltablespace;
+	key.relfilenode = relfilenode;
+
+	/*
+	 * Check cache and return entry if one is found. Even if no target
+	 * relation can be found later on we store the negative match and return a
+	 * InvalidOid from cache. That's not really necessary for performance
+	 * since querying invalid values isn't supposed to be a frequent thing,
+	 * but it's basically free.
+	 */
+	entry = hash_search(RelfilenodeMapHashDirty, (void *) &key, HASH_FIND, &found);
+
+	if (found)
+		return entry->relid;
+
+	/* ok, no previous cache entry, do it the hard way */
+
+	/* initialize empty/negative cache entry before doing the actual lookups */
+	relid = InvalidOid;
+
+	if (reltablespace == GLOBALTABLESPACE_OID)
+	{
+		/*
+		 * Ok, shared table, check relmapper.
+		 */
+		relid = RelationMapFilenodeToOid(relfilenode, true);
+	}
+	else
+	{
+		/*
+		 * Not a shared table, could either be a plain relation or a
+		 * non-shared, nailed one, like e.g. pg_class.
+		 */
+		/* check for plain relations by looking in pg_class */
+#if PG_VERSION_NUM >= 120000
+		relation = table_open(RelationRelationId, AccessShareLock);
+#else
+		relation = heap_open(RelationRelationId, AccessShareLock);
+#endif
+		/* copy scankey to local copy, it will be modified during the scan */
+		memcpy(skey, relfilenode_skey_dirty, sizeof(skey));
+
+		/* set scan arguments */
+		skey[0].sk_argument = ObjectIdGetDatum(reltablespace);
+		skey[1].sk_argument = ObjectIdGetDatum(relfilenode);
+
+		scandesc = systable_beginscan(relation,
+							ClassTblspcRelfilenodeIndexId,
+							true,
+							&DirtySnapshot,
+							2,
+							skey);
+
+		found = false;
+
+		while (HeapTupleIsValid(ntp = systable_getnext(scandesc)))
+		{
+#if PG_VERSION_NUM >= 120000
+			Form_pg_class classform = (Form_pg_class) GETSTRUCT(ntp);
+
+			if (found)
+				elog(ERROR,
+					"unexpected duplicate for tablespace %u, relfilenode %u",
+					reltablespace, relfilenode);
+			found = true;
+
+			Assert(classform->reltablespace == reltablespace);
+			Assert(classform->relfilenode == relfilenode);
+			relid = classform->oid;
+#else
+			if (found)
+				elog(ERROR,
+					"unexpected duplicate for tablespace %u, relfilenode %u",
+					reltablespace, relfilenode);
+			found = true;
+			relid = HeapTupleGetOid(ntp);
+#endif
+		}
+
+		systable_endscan(scandesc);
+#if PG_VERSION_NUM >= 120000
+		table_close(relation, AccessShareLock);
+#else
+		heap_close(relation, AccessShareLock);
+#endif
+		/* check for tables that are mapped but not shared */
+		if (!found)
+			relid = RelationMapFilenodeToOid(relfilenode, false);
+	}
+
+	/*
+	 * Only enter entry into cache now, our opening of pg_class could have
+	 * caused cache invalidations to be executed which would have deleted a
+	 * new entry if we had entered it above.
+	 */
+	entry = hash_search(RelfilenodeMapHashDirty, (void *) &key, HASH_ENTER, &found);
+	if (found)
+		elog(ERROR, "corrupted hashtable");
+	entry->relid = relid;
+
+	return relid;
 }
 
 Datum
 pg_list_orphaned(PG_FUNCTION_ARGS)
 {
 
-	const char *dbName = NULL;
-	DIR                *dirdesc;
-	struct dirent *direntry;
-	char            dirpath[MAXPGPATH];
-	char            dir[MAXPGPATH + 21 + sizeof(TABLESPACE_VERSION_DIRECTORY)];
-	Oid                     reltbsnode = InvalidOid;
-	char *reltbsname;
-	MemoryContext   mctx;
-
-	dbName=get_database_name(MyDatabaseId);
-	mctx = MemoryContextSwitchTo(TopMemoryContext);
-
-	list_free_deep(list_orphaned_relations);
-	list_orphaned_relations=NIL;
-
-	/* default tablespace */
-	snprintf(dir, sizeof(dir), "base/%u", MyDatabaseId);
-	search_orphaned(&list_orphaned_relations, MyDatabaseId, dbName, dir, 0);
-
-	/* Scan the non-default tablespaces */
-	snprintf(dirpath, MAXPGPATH, "pg_tblspc");
-	dirdesc = AllocateDir(dirpath);
-
-	while ((direntry = ReadDir(dirdesc, dirpath)) != NULL)
-	{
-		CHECK_FOR_INTERRUPTS();
-
-		if (strcmp(direntry->d_name, ".") == 0 ||
-			strcmp(direntry->d_name, "..") == 0)
-			continue;
-
-		snprintf(dir, sizeof(dir), "pg_tblspc/%s/%s/%u",
-			direntry->d_name, TABLESPACE_VERSION_DIRECTORY, MyDatabaseId);
-
-		reltbsname = strdup(direntry->d_name);
-		reltbsnode = (Oid) strtoul(reltbsname, &reltbsname, 10);
-
-		search_orphaned(&list_orphaned_relations, MyDatabaseId, dbName, dir, reltbsnode);
-	}
-	FreeDir(dirdesc);
-	MemoryContextSwitchTo(mctx);
-
+	pg_build_orphaned_list(MyDatabaseId);
 	pg_list_orphaned_internal(fcinfo);
 	return (Datum) 0;
+}
+
+
+Datum
+pg_remove_orphaned(PG_FUNCTION_ARGS)
+{
+
+	Oid                     dbOid;
+	ListCell   *cell;
+
+	dbOid = MyDatabaseId;
+	pg_build_orphaned_list(dbOid);
+
+	for (cell = list_head(list_orphaned_relations); cell != NULL; cell = lnext(cell))
+	{
+		char  orphaned_file[MAXPGPATH + 21 + sizeof(TABLESPACE_VERSION_DIRECTORY) + sizeof(Oid)] = {0};
+		OrphanedRelation  *orph = (OrphanedRelation *)lfirst(cell);
+		strcat(orphaned_file, orph->path);
+		strcat(orphaned_file, "/");
+		strcat(orphaned_file, orph->name);
+		durable_unlink(orphaned_file,ERROR);
+	}
+
+	PG_RETURN_VOID();
 }
 
 void
@@ -231,8 +425,8 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 			orph = palloc(sizeof(*orph));
 			relfilename = strdup(de->d_name);
 			relfilenode = (Oid) strtoul(relfilename, &relfilename, 10);
-			oidrel = RelidByRelfilenode(reltablespace, relfilenode);
-			if (!OidIsValid(oidrel) && !is_lock_on_relation(dboid,relfilenode)) {
+			oidrel = RelidByRelfilenodeDirty(reltablespace, relfilenode);
+			if (!OidIsValid(oidrel)) {
 				orph->dbname = strdup(dbname);
 				orph->path = strdup(dir);
 				orph->name = strdup(de->d_name);
@@ -288,8 +482,8 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 							orph = palloc(sizeof(*orph));
 							relfilename = strdup(t);
 							relfilenode = (Oid) strtoul(relfilename, &relfilename, 10);
-							oidrel = RelidByRelfilenode(reltablespace, relfilenode);
-							if (!OidIsValid(oidrel) && !is_lock_on_relation(dboid,relfilenode)) {
+							oidrel = RelidByRelfilenodeDirty(reltablespace, relfilenode);
+							if (!OidIsValid(oidrel)) {
 								orph->dbname = strdup(dbname);
 								orph->path = strdup(dir);
 								orph->name = strdup(de->d_name);
@@ -314,4 +508,52 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 		}
 	}
 	FreeDir(dirdesc);
+}
+
+
+void
+pg_build_orphaned_list(Oid dbOid)
+{
+
+	const char *dbName = NULL;
+	DIR                *dirdesc;
+	struct dirent *direntry;
+	char            dirpath[MAXPGPATH];
+	char            dir[MAXPGPATH + 21 + sizeof(TABLESPACE_VERSION_DIRECTORY)];
+	Oid                     reltbsnode = InvalidOid;
+	char *reltbsname;
+	MemoryContext   mctx;
+
+	dbName=get_database_name(MyDatabaseId);
+	mctx = MemoryContextSwitchTo(TopMemoryContext);
+
+	list_free_deep(list_orphaned_relations);
+	list_orphaned_relations=NIL;
+
+	/* default tablespace */
+	snprintf(dir, sizeof(dir), "base/%u", dbOid);
+	search_orphaned(&list_orphaned_relations, dbOid, dbName, dir, 0);
+
+	/* Scan the non-default tablespaces */
+	snprintf(dirpath, MAXPGPATH, "pg_tblspc");
+	dirdesc = AllocateDir(dirpath);
+
+	while ((direntry = ReadDir(dirdesc, dirpath)) != NULL)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		if (strcmp(direntry->d_name, ".") == 0 ||
+			strcmp(direntry->d_name, "..") == 0)
+			continue;
+
+		snprintf(dir, sizeof(dir), "pg_tblspc/%s/%s/%u",
+			direntry->d_name, TABLESPACE_VERSION_DIRECTORY, dbOid);
+
+		reltbsname = strdup(direntry->d_name);
+		reltbsnode = (Oid) strtoul(reltbsname, &reltbsname, 10);
+
+		search_orphaned(&list_orphaned_relations, dbOid, dbName, dir, reltbsnode);
+	}
+	FreeDir(dirdesc);
+	MemoryContextSwitchTo(mctx);
 }

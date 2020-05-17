@@ -1,5 +1,5 @@
 MODULE_big = pg_orphaned
-OBJS = pg_orphaned.o $(WIN32RES)
+OBJS = pg_orphaned.o
 
 EXTENSION = pg_orphaned
 DATA = pg_orphaned--1.0.sql
