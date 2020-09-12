@@ -325,7 +325,7 @@ pg_remove_orphaned(PG_FUNCTION_ARGS)
 
 	for (cell = list_head(list_orphaned_relations); cell != NULL; cell = lnext(cell))
 	{
-		char  orphaned_file[MAXPGPATH + 21 + sizeof(TABLESPACE_VERSION_DIRECTORY) + sizeof(Oid)] = {0};
+		char  orphaned_file[MAXPGPATH + 21 + sizeof(TABLESPACE_VERSION_DIRECTORY) + 10] = {0};
 		OrphanedRelation  *orph = (OrphanedRelation *)lfirst(cell);
 		strcat(orphaned_file, orph->path);
 		strcat(orphaned_file, "/");
