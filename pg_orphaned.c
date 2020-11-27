@@ -168,7 +168,11 @@ pg_list_orphaned_internal(FunctionCallInfo fcinfo)
 	rsinfo->setDesc = tupdesc;
 	MemoryContextSwitchTo(oldcontext);
 
+#if PG_VERSION_NUM >= 130000
+	for (cell = list_head(list_orphaned_relations); cell != NULL; cell = lnext(list_orphaned_relations, cell))
+#else
 	for (cell = list_head(list_orphaned_relations); cell != NULL; cell = lnext(cell))
+#endif
 	{
 		OrphanedRelation  *orph = (OrphanedRelation *)lfirst(cell);
 
