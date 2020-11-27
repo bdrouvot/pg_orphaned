@@ -84,9 +84,11 @@ is_lock_on_relation(Oid database, Oid relation)
 					pfree (mystatus);
 					return true;
 				}
+				break;
 			default:
-				mystatus->currIdx++;
+				break;
 		}
+		mystatus->currIdx++;
 	}
 	pfree (mystatus);
 	return false;
