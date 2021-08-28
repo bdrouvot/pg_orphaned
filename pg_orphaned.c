@@ -81,7 +81,7 @@ is_lock_on_relation(Oid database, Oid relation)
 			case LOCKTAG_RELATION:
 			case LOCKTAG_RELATION_EXTEND:
 				if (instance->locktag.locktag_field1 == database && instance->locktag.locktag_field2 == relation) {
-					pfree (mystatus);
+					pfree(mystatus);
 					return true;
 				}
 				break;
@@ -90,7 +90,7 @@ is_lock_on_relation(Oid database, Oid relation)
 		}
 		mystatus->currIdx++;
 	}
-	pfree (mystatus);
+	pfree(mystatus);
 	return false;
 }
 
@@ -280,7 +280,7 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 							REG_ADVANCED | REG_NOSUB,
 							DEFAULT_COLLATION_OID);
 
-			pfree (regwstr);
+			pfree(regwstr);
 
 			if (regcomp_result == REG_OKAY) {
 				wstr = palloc((strlen(de->d_name) + 1) * sizeof(pg_wchar));
@@ -308,7 +308,7 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 						}	
 					}
 				}
-				pfree (wstr);
+				pfree(wstr);
 			} else {
 				/* regex didn't compile */
 				pg_regerror(regcomp_result, preg, errMsg, sizeof(errMsg));
@@ -316,7 +316,7 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 							(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
 							errmsg("invalid regular expression: %s", errMsg)));
 			}
-			pg_regfree (preg);
+			pg_regfree(preg);
 		}
 	}
 	FreeDir(dirdesc);
