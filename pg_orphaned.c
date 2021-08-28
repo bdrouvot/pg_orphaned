@@ -10,18 +10,17 @@
 
 #include "postgres.h"
 #include "miscadmin.h"
-#include "access/twophase.h"
+#include "utils/timestamp.h"
+#include "storage/lock.h"
 #include "funcapi.h"
 #include "utils/builtins.h"
 #include <sys/stat.h>
-#include "utils/relfilenodemap.h"
 #include "commands/dbcommands.h"
-#include "mb/pg_wchar.h"
 #include "regex/regex.h"
+
 #if PG_VERSION_NUM < 110000
 #include "catalog/pg_collation.h"
 #include "catalog/catalog.h"
-#include "utils/timestamp.h"
 #include "utils/memutils.h"
 #include "catalog/pg_tablespace.h"
 #else
@@ -29,11 +28,13 @@
 #include "catalog/pg_tablespace_d.h"
 #include "utils/rel.h"
 #endif
+
 #include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/relmapper.h"
 #include "catalog/indexing.h"
 #include "utils/inval.h"
+
 #if PG_VERSION_NUM >= 120000
 #include "access/table.h"
 #include "access/genam.h"
@@ -42,6 +43,7 @@
 #include "utils/tqual.h"
 #include "access/htup_details.h"
 #endif
+#include "common/file_perm.h"
 
 PG_MODULE_MAGIC;
 Datum pg_list_orphaned(PG_FUNCTION_ARGS);
@@ -66,13 +68,13 @@ typedef struct
 {
 	Oid                     reltablespace;
 	Oid                     relfilenode;
-} RelfilenodeMapKey;
+} RelfilenodeMapKeyDirty;
 
 typedef struct
 {
-	RelfilenodeMapKey key;          /* lookup key - must be first */
+	RelfilenodeMapKeyDirty key;          /* lookup key - must be first */
 	Oid                     relid;                  /* pg_class.oid */
-} RelfilenodeMapEntry;
+} RelfilenodeMapEntryDirty;
 
 typedef struct OrphanedRelation {
 	char	   *dbname;
@@ -92,13 +94,13 @@ static void
 RelfilenodeMapInvalidateCallbackDirty(Datum arg, Oid relid)
 {
 	HASH_SEQ_STATUS status;
-	RelfilenodeMapEntry *entry;
+	RelfilenodeMapEntryDirty *entry;
 
 	/* callback only gets registered after creating the hash */
 	Assert(RelfilenodeMapHashDirty != NULL);
 
 	hash_seq_init(&status, RelfilenodeMapHashDirty);
-	while ((entry = (RelfilenodeMapEntry *) hash_seq_search(&status)) != NULL)
+	while ((entry = (RelfilenodeMapEntryDirty *) hash_seq_search(&status)) != NULL)
 	{
 		/*
 		 * If relid is InvalidOid, signalling a complete reset, we must remove
@@ -150,8 +152,8 @@ InitializeRelfilenodeMapDirty(void)
 
 	/* Initialize the hash table. */
 	MemSet(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(RelfilenodeMapKey);
-	ctl.entrysize = sizeof(RelfilenodeMapEntry);
+	ctl.keysize = sizeof(RelfilenodeMapKeyDirty);
+	ctl.entrysize = sizeof(RelfilenodeMapEntryDirty);
 	ctl.hcxt = CacheMemoryContext;
 
 	/*
@@ -181,8 +183,8 @@ InitializeRelfilenodeMapDirty(void)
 Oid
 RelidByRelfilenodeDirty(Oid reltablespace, Oid relfilenode)
 {
-	RelfilenodeMapKey key;
-	RelfilenodeMapEntry *entry;
+	RelfilenodeMapKeyDirty key;
+	RelfilenodeMapEntryDirty *entry;
 	bool            found;
 	SysScanDesc scandesc;
 	Relation        relation;
@@ -260,20 +262,12 @@ RelidByRelfilenodeDirty(Oid reltablespace, Oid relfilenode)
 #if PG_VERSION_NUM >= 120000
 			Form_pg_class classform = (Form_pg_class) GETSTRUCT(ntp);
 
-			if (found)
-				elog(ERROR,
-					"unexpected duplicate for tablespace %u, relfilenode %u",
-					reltablespace, relfilenode);
 			found = true;
 
 			Assert(classform->reltablespace == reltablespace);
 			Assert(classform->relfilenode == relfilenode);
 			relid = classform->oid;
 #else
-			if (found)
-				elog(ERROR,
-					"unexpected duplicate for tablespace %u, relfilenode %u",
-					reltablespace, relfilenode);
 			found = true;
 			relid = HeapTupleGetOid(ntp);
 #endif
@@ -323,7 +317,11 @@ pg_remove_orphaned(PG_FUNCTION_ARGS)
 	dbOid = MyDatabaseId;
 	pg_build_orphaned_list(dbOid);
 
+#if PG_VERSION_NUM >= 130000
+	for (cell = list_head(list_orphaned_relations); cell != NULL; cell = lnext(list_orphaned_relations, cell))
+#else
 	for (cell = list_head(list_orphaned_relations); cell != NULL; cell = lnext(cell))
+#endif
 	{
 		char  orphaned_file[MAXPGPATH + 21 + sizeof(TABLESPACE_VERSION_DIRECTORY) + 10] = {0};
 		OrphanedRelation  *orph = (OrphanedRelation *)lfirst(cell);
@@ -362,7 +360,11 @@ pg_list_orphaned_internal(FunctionCallInfo fcinfo)
 	rsinfo->setDesc = tupdesc;
 	MemoryContextSwitchTo(oldcontext);
 
+#if PG_VERSION_NUM >= 130000
+	for (cell = list_head(list_orphaned_relations); cell != NULL; cell = lnext(list_orphaned_relations, cell))
+#else
 	for (cell = list_head(list_orphaned_relations); cell != NULL; cell = lnext(cell))
+#endif
 	{
 		OrphanedRelation  *orph = (OrphanedRelation *)lfirst(cell);
 
@@ -468,7 +470,7 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 							REG_ADVANCED | REG_NOSUB,
 							DEFAULT_COLLATION_OID);
 
-			pfree (regwstr);
+			pfree(regwstr);
 
 			if (regcomp_result == REG_OKAY) {
 				wstr = palloc((strlen(de->d_name) + 1) * sizeof(pg_wchar));
@@ -496,7 +498,7 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 						}	
 					}
 				}
-				pfree (wstr);
+				pfree(wstr);
 			} else {
 				/* regex didn't compile */
 				pg_regerror(regcomp_result, preg, errMsg, sizeof(errMsg));
@@ -504,7 +506,7 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 							(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
 							errmsg("invalid regular expression: %s", errMsg)));
 			}
-			pg_regfree (preg);
+			pg_regfree(preg);
 		}
 	}
 	FreeDir(dirdesc);
