@@ -10,25 +10,39 @@
 
 #include "postgres.h"
 #include "miscadmin.h"
-#include "access/twophase.h"
+#include "utils/timestamp.h"
 #include "funcapi.h"
 #include "utils/builtins.h"
 #include <sys/stat.h>
-#include "utils/relfilenodemap.h"
 #include "commands/dbcommands.h"
-#include "mb/pg_wchar.h"
 #include "regex/regex.h"
+
 #if PG_VERSION_NUM < 110000
 #include "catalog/pg_collation.h"
 #include "catalog/catalog.h"
 #include "utils/memutils.h"
-#include "utils/timestamp.h"
+#include "catalog/pg_tablespace.h"
 #else
 #include "catalog/pg_collation_d.h"
+#include "catalog/pg_tablespace_d.h"
+#include "utils/rel.h"
 #endif
-#include "storage/lock.h"
-#include "storage/predicate_internals.h"
 
+#include "utils/catcache.h"
+#include "utils/fmgroids.h"
+#include "utils/relmapper.h"
+#include "catalog/indexing.h"
+#include "utils/inval.h"
+
+#if PG_VERSION_NUM >= 120000
+#include "access/table.h"
+#include "access/genam.h"
+#include "utils/snapmgr.h"
+#else
+#include "utils/tqual.h"
+#include "access/htup_details.h"
+#endif
+#include "common/file_perm.h"
 
 PG_MODULE_MAGIC;
 Datum pg_list_orphaned(PG_FUNCTION_ARGS);
@@ -37,13 +51,26 @@ PG_FUNCTION_INFO_V1(pg_list_orphaned);
 List   *list_orphaned_relations=NULL;
 static void pg_list_orphaned_internal(FunctionCallInfo fcinfo);
 static void search_orphaned(List **flist, Oid dboid, const char *dbname, const char *dir, Oid reltablespace);
-static bool is_lock_on_relation(Oid database, Oid relation);
+
+static Oid RelidByRelfilenodeDirty(Oid reltablespace, Oid relfilenode);
+
+/* Hash table for information about each relfilenode <-> oid pair */
+static HTAB *RelfilenodeMapHashDirty = NULL;
+
+/* built first time through in InitializeRelfilenodeMap */
+static ScanKeyData relfilenode_skey_dirty[2];
 
 typedef struct
 {
-        LockData   *lockData;
-        int        currIdx;
-} Relation_Lock_Status;
+	Oid                     reltablespace;
+	Oid                     relfilenode;
+} RelfilenodeMapKeyDirty;
+
+typedef struct
+{
+	RelfilenodeMapKeyDirty key;          /* lookup key - must be first */
+	Oid                     relid;                  /* pg_class.oid */
+} RelfilenodeMapEntryDirty;
 
 typedef struct OrphanedRelation {
 	char	   *dbname;
@@ -54,45 +81,6 @@ typedef struct OrphanedRelation {
 	Oid relfilenode;
 	Oid reloid;
 } OrphanedRelation;
-
-/* Using is_lock_on_relation
- * to avoid reporting files as orphaned
- * for relations that are not yet visibles
- * like not yet committed/rollbacked
- * or creation in progress
- */
-static bool
-is_lock_on_relation(Oid database, Oid relation)
-{
-	Relation_Lock_Status *mystatus;
-	LockData   *lockData;
-
-	mystatus = (Relation_Lock_Status *) palloc(sizeof(Relation_Lock_Status));
-	mystatus->lockData = GetLockStatusData();
-	mystatus->currIdx = 0;
-	lockData = mystatus->lockData;
-
-	while (mystatus->currIdx < lockData->nelements)
-	{
-		LockInstanceData *instance;
-		instance = &(lockData->locks[mystatus->currIdx]);
-		switch ((LockTagType) instance->locktag.locktag_type)
-		{
-			case LOCKTAG_RELATION:
-			case LOCKTAG_RELATION_EXTEND:
-				if (instance->locktag.locktag_field1 == database && instance->locktag.locktag_field2 == relation) {
-					pfree (mystatus);
-					return true;
-				}
-				break;
-			default:
-				break;
-		}
-		mystatus->currIdx++;
-	}
-	pfree (mystatus);
-	return false;
-}
 
 Datum
 pg_list_orphaned(PG_FUNCTION_ARGS)
@@ -237,8 +225,8 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 			orph = palloc(sizeof(*orph));
 			relfilename = strdup(de->d_name);
 			relfilenode = (Oid) strtoul(relfilename, &relfilename, 10);
-			oidrel = RelidByRelfilenode(reltablespace, relfilenode);
-			if (!OidIsValid(oidrel) && !is_lock_on_relation(dboid,relfilenode)) {
+			oidrel = RelidByRelfilenodeDirty(reltablespace, relfilenode);
+			if (!OidIsValid(oidrel)) {
 				orph->dbname = strdup(dbname);
 				orph->path = strdup(dir);
 				orph->name = strdup(de->d_name);
@@ -280,7 +268,7 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 							REG_ADVANCED | REG_NOSUB,
 							DEFAULT_COLLATION_OID);
 
-			pfree (regwstr);
+			pfree(regwstr);
 
 			if (regcomp_result == REG_OKAY) {
 				wstr = palloc((strlen(de->d_name) + 1) * sizeof(pg_wchar));
@@ -294,8 +282,8 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 							orph = palloc(sizeof(*orph));
 							relfilename = strdup(t);
 							relfilenode = (Oid) strtoul(relfilename, &relfilename, 10);
-							oidrel = RelidByRelfilenode(reltablespace, relfilenode);
-							if (!OidIsValid(oidrel) && !is_lock_on_relation(dboid,relfilenode)) {
+							oidrel = RelidByRelfilenodeDirty(reltablespace, relfilenode);
+							if (!OidIsValid(oidrel)) {
 								orph->dbname = strdup(dbname);
 								orph->path = strdup(dir);
 								orph->name = strdup(de->d_name);
@@ -308,7 +296,7 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 						}	
 					}
 				}
-				pfree (wstr);
+				pfree(wstr);
 			} else {
 				/* regex didn't compile */
 				pg_regerror(regcomp_result, preg, errMsg, sizeof(errMsg));
@@ -316,8 +304,218 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 							(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
 							errmsg("invalid regular expression: %s", errMsg)));
 			}
-			pg_regfree (preg);
+			pg_regfree(preg);
 		}
 	}
 	FreeDir(dirdesc);
+}
+/*
+ *  Flush mapping entries when pg_class is updated in a relevant fashion.
+ *  Same as RelfilenodeMapInvalidateCallback in relfilenodemap.c
+ */
+static void
+RelfilenodeMapInvalidateCallbackDirty(Datum arg, Oid relid)
+{
+	HASH_SEQ_STATUS status;
+	RelfilenodeMapEntryDirty *entry;
+
+	/* callback only gets registered after creating the hash */
+	Assert(RelfilenodeMapHashDirty != NULL);
+
+	hash_seq_init(&status, RelfilenodeMapHashDirty);
+	while ((entry = (RelfilenodeMapEntryDirty *) hash_seq_search(&status)) != NULL)
+	{
+		/*
+		 * If relid is InvalidOid, signalling a complete reset, we must remove
+		 * all entries, otherwise just remove the specific relation's entry.
+		 * Always remove negative cache entries.
+		 */
+		if (relid == InvalidOid ||      /* complete reset */
+			entry->relid == InvalidOid ||   /* negative cache entry */
+			entry->relid == relid)  /* individual flushed relation */
+		{
+			if (hash_search(RelfilenodeMapHashDirty,
+							(void *) &entry->key,
+							HASH_REMOVE,
+							NULL) == NULL)
+						elog(ERROR, "hash table corrupted");
+		}
+	}
+}
+
+/*
+ * Initialize cache, either on first use or after a reset.
+ * Same as InitializeRelfilenodeMap in relfilenodemap.c
+ */
+static void
+InitializeRelfilenodeMapDirty(void)
+{
+	HASHCTL         ctl;
+	int                     i;
+
+	/* Make sure we've initialized CacheMemoryContext. */
+	if (CacheMemoryContext == NULL)
+		CreateCacheMemoryContext();
+
+	/* build skey */
+	MemSet(&relfilenode_skey_dirty, 0, sizeof(relfilenode_skey_dirty));
+
+	for (i = 0; i < 2; i++)
+	{
+		fmgr_info_cxt(F_OIDEQ,
+					&relfilenode_skey_dirty[i].sk_func,
+					CacheMemoryContext);
+		relfilenode_skey_dirty[i].sk_strategy = BTEqualStrategyNumber;
+		relfilenode_skey_dirty[i].sk_subtype = InvalidOid;
+		relfilenode_skey_dirty[i].sk_collation = InvalidOid;
+	}
+
+	relfilenode_skey_dirty[0].sk_attno = Anum_pg_class_reltablespace;
+	relfilenode_skey_dirty[1].sk_attno = Anum_pg_class_relfilenode;
+
+	/* Initialize the hash table. */
+	MemSet(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(RelfilenodeMapKeyDirty);
+	ctl.entrysize = sizeof(RelfilenodeMapEntryDirty);
+	ctl.hcxt = CacheMemoryContext;
+
+	/*
+	 * Only create the RelfilenodeMapHashDirty now, so we don't end up partially
+	 * initialized when fmgr_info_cxt() above ERRORs out with an out of memory
+	 * error.
+	 */
+	RelfilenodeMapHashDirty =
+		hash_create("RelfilenodeMap cache", 64, &ctl,
+			HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/* Watch for invalidation events. */
+	CacheRegisterRelcacheCallback(RelfilenodeMapInvalidateCallbackDirty,
+									(Datum) 0);
+}
+
+
+/*
+ * Map a relation's (tablespace, filenode) to a relation's oid and cache the
+ * result.
+ *
+ * This is the same as the existing RelidByRelfilenode in relfilenodemap.c but
+ * it is done by using a DirtySnapshot as we want to see relation being created
+ *
+ * Returns InvalidOid if no relation matching the criteria could be found.
+ */
+Oid
+RelidByRelfilenodeDirty(Oid reltablespace, Oid relfilenode)
+{
+	RelfilenodeMapKeyDirty key;
+	RelfilenodeMapEntryDirty *entry;
+	bool            found;
+	SysScanDesc scandesc;
+	Relation        relation;
+	HeapTuple       ntp;
+	ScanKeyData skey[2];
+	Oid                     relid;
+	SnapshotData DirtySnapshot;
+
+	InitDirtySnapshot(DirtySnapshot);
+	if (RelfilenodeMapHashDirty == NULL)
+		InitializeRelfilenodeMapDirty();
+
+	/* pg_class will show 0 when the value is actually MyDatabaseTableSpace */
+	if (reltablespace == MyDatabaseTableSpace)
+		reltablespace = 0;
+
+	MemSet(&key, 0, sizeof(key));
+	key.reltablespace = reltablespace;
+	key.relfilenode = relfilenode;
+
+	/*
+	 * Check cache and return entry if one is found. Even if no target
+	 * relation can be found later on we store the negative match and return a
+	 * InvalidOid from cache. That's not really necessary for performance
+	 * since querying invalid values isn't supposed to be a frequent thing,
+	 * but it's basically free.
+	 */
+	entry = hash_search(RelfilenodeMapHashDirty, (void *) &key, HASH_FIND, &found);
+
+	if (found)
+		return entry->relid;
+
+	/* ok, no previous cache entry, do it the hard way */
+
+	/* initialize empty/negative cache entry before doing the actual lookups */
+	relid = InvalidOid;
+
+	if (reltablespace == GLOBALTABLESPACE_OID)
+	{
+		/*
+		 * Ok, shared table, check relmapper.
+		 */
+		relid = RelationMapFilenodeToOid(relfilenode, true);
+	}
+	else
+	{
+		/*
+		 * Not a shared table, could either be a plain relation or a
+		 * non-shared, nailed one, like e.g. pg_class.
+		 */
+		/* check for plain relations by looking in pg_class */
+#if PG_VERSION_NUM >= 120000
+		relation = table_open(RelationRelationId, AccessShareLock);
+#else
+		relation = heap_open(RelationRelationId, AccessShareLock);
+#endif
+		/* copy scankey to local copy, it will be modified during the scan */
+		memcpy(skey, relfilenode_skey_dirty, sizeof(skey));
+
+		/* set scan arguments */
+		skey[0].sk_argument = ObjectIdGetDatum(reltablespace);
+		skey[1].sk_argument = ObjectIdGetDatum(relfilenode);
+
+		scandesc = systable_beginscan(relation,
+							ClassTblspcRelfilenodeIndexId,
+							true,
+							&DirtySnapshot,
+							2,
+							skey);
+
+		found = false;
+
+		while (HeapTupleIsValid(ntp = systable_getnext(scandesc)))
+		{
+#if PG_VERSION_NUM >= 120000
+			Form_pg_class classform = (Form_pg_class) GETSTRUCT(ntp);
+
+			found = true;
+
+			Assert(classform->reltablespace == reltablespace);
+			Assert(classform->relfilenode == relfilenode);
+			relid = classform->oid;
+#else
+			found = true;
+			relid = HeapTupleGetOid(ntp);
+#endif
+		}
+
+		systable_endscan(scandesc);
+#if PG_VERSION_NUM >= 120000
+		table_close(relation, AccessShareLock);
+#else
+		heap_close(relation, AccessShareLock);
+#endif
+		/* check for tables that are mapped but not shared */
+		if (!found)
+			relid = RelationMapFilenodeToOid(relfilenode, false);
+	}
+
+	/*
+	 * Only enter entry into cache now, our opening of pg_class could have
+	 * caused cache invalidations to be executed which would have deleted a
+	 * new entry if we had entered it above.
+	 */
+	entry = hash_search(RelfilenodeMapHashDirty, (void *) &key, HASH_ENTER, &found);
+	if (found)
+		elog(ERROR, "corrupted hashtable");
+	entry->relid = relid;
+
+	return relid;
 }

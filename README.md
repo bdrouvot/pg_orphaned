@@ -162,7 +162,7 @@ test=# select * from pg_list_orphaned() order by relfilenode;
 Remarks
 =======
 * double check carefully before taking any actions on those files
-* has been tested from version 10 to 12.2
+* has been tested from version 10 to 13
 * pg_list_orphaned does the search for the database it is connected to
 
 License
