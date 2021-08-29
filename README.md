@@ -4,7 +4,17 @@ pg_orphaned
 Features
 --------
 
-Allow to list orphaned relations thanks to a *pg_list_orphaned* function.
+Allow to list orphaned files thanks to a *pg_list_orphaned* function.
+
+Introduction
+============
+
+If you are not aware of orphaned files, you can have a look to [this blog post first.](https://blog.dbi-services.com/can-there-be-orphaned-data-files-in-postgresql/)
+
+While you could get a list of the orphaned files with a query (as the one into the blog post mentioned above), you could get
+false positive due to in progress transactions (means started and not committed or rolled back yet) that are creating files (like create table, relation rewrites...).
+
+This extension is taking care of such corner cases by using a dirty snapshot while looking for the relfilnode(s) in pg_class.
 
 Installation
 ============
@@ -158,12 +168,37 @@ test=# select * from pg_list_orphaned() order by relfilenode;
  test   | base/311377 | t4_311380   | 1073741824 | 2020-05-03 17:34:59+00 |      311380 |      0
 (2 rows)
 ```
+Example 4 (deal with in progress transaction):
+----------
+```
+Session 1:
 
+postgres=# begin;
+BEGIN
+postgres=*# create table bdtinpgro (a int);
+CREATE TABLE
+
+Session 2 would report a false orphaned file if using a query like:
+
+postgres=# select * from pg_ls_dir ( '/home/postgres/pgorph/pg_installed/data/base/13580' ) as file where file ~ '^[0-9]*$' and file::text not in (select oid::text from pg_class );
+ file
+-------
+ 16408
+(1 row)
+
+while the extension would not report this false positive:
+
+postgres=# select * from pg_list_orphaned();
+ dbname | path | name | size | mod_time | relfilenode | reloid
+--------+------+------+------+----------+-------------+--------
+(0 rows)
+```
 Remarks
 =======
 * double check carefully before taking any actions on those files
 * has been tested from version 10 to 13
 * pg_list_orphaned does the search for the database it is connected to
+* at the tilme of this writing (08/2021) there is a [commitfest entry](https://commitfest.postgresql.org/34/3228/) to avoid orphaned files
 
 License
 =======
