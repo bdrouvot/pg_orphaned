@@ -226,7 +226,11 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 			relfilename = strdup(de->d_name);
 			relfilenode = (Oid) strtoul(relfilename, &relfilename, 10);
 			oidrel = RelidByRelfilenodeDirty(reltablespace, relfilenode);
-			if (!OidIsValid(oidrel)) {
+			/*
+			 * Also filter if first segment AND size is zero
+			 * due to https://github.com/postgres/postgres/blob/REL_12_8/src/backend/storage/smgr/md.c#L225
+			 */
+			if (!OidIsValid(oidrel) && !(attrib.st_size == 0 && strstr(de->d_name, ".") == NULL)) {
 				orph->dbname = strdup(dbname);
 				orph->path = strdup(dir);
 				orph->name = strdup(de->d_name);
