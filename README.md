@@ -193,12 +193,37 @@ postgres=# select * from pg_list_orphaned();
 --------+------+------+------+----------+-------------+--------
 (0 rows)
 ```
+Example 5 (from 10/28/2021):
+----------
+* pg_list_orphaned() now takes an interval as a parameter (default 1 Day).
+* It is used to populate the new "older" column with a boolean to indicate if the orphaned file is older than the interval.
+```
+postgres=# select now();
+              now
+-------------------------------
+ 2021-10-28 13:20:24.734192+00
+(1 row)
+
+postgres=# select * from pg_list_orphaned();
+  dbname  |    path    | name  |  size  |        mod_time        | relfilenode | reloid | older
+----------+------------+-------+--------+------------------------+-------------+--------+-------
+ postgres | base/13214 | 16391 | 106496 | 2021-10-28 13:19:56+00 |       16391 |      0 | f
+ postgres | base/13214 | 16388 | 147456 | 2021-10-28 13:19:56+00 |       16388 |      0 | f
+(2 rows)
+
+postgres=# select * from pg_list_orphaned('10 seconds');
+  dbname  |    path    | name  |  size  |        mod_time        | relfilenode | reloid | older
+----------+------------+-------+--------+------------------------+-------------+--------+-------
+ postgres | base/13214 | 16391 | 106496 | 2021-10-28 13:19:56+00 |       16391 |      0 | t
+ postgres | base/13214 | 16388 | 147456 | 2021-10-28 13:19:56+00 |       16388 |      0 | t
+(2 rows)
+```
 Remarks
 =======
 * double check carefully before taking any actions on those files
-* has been tested from version 10 to 13
+* has been tested from version 10 to 14
 * pg_list_orphaned does the search for the database it is connected to
-* at the tilme of this writing (08/2021) there is a [commitfest entry](https://commitfest.postgresql.org/34/3228/) to avoid orphaned files
+* at the time of this writing (08/2021) there is a [commitfest entry](https://commitfest.postgresql.org/34/3228/) to avoid orphaned files
 
 License
 =======

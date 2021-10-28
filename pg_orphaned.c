@@ -26,6 +26,7 @@
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_tablespace_d.h"
 #include "utils/rel.h"
+#include "common/file_perm.h"
 #endif
 
 #include "utils/catcache.h"
@@ -42,13 +43,13 @@
 #include "utils/tqual.h"
 #include "access/htup_details.h"
 #endif
-#include "common/file_perm.h"
 
 PG_MODULE_MAGIC;
 Datum pg_list_orphaned(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(pg_list_orphaned);
 
 List   *list_orphaned_relations=NULL;
+static Timestamp limitts;
 static void pg_list_orphaned_internal(FunctionCallInfo fcinfo);
 static void search_orphaned(List **flist, Oid dboid, const char *dbname, const char *dir, Oid reltablespace);
 
@@ -95,6 +96,12 @@ pg_list_orphaned(PG_FUNCTION_ARGS)
 	char *reltbsname;
 	MemoryContext   mctx;
 
+	if (PG_ARGISNULL(0))
+		limitts = GetCurrentTimestamp() - ((3600000 * 24) * (int64) 1000); // 1 Day
+	else
+		limitts = DatumGetTimestamp(DirectFunctionCall2(timestamp_mi_interval,
+														TimestampGetDatum(GetCurrentTimestamp()),
+																			IntervalPGetDatum(PG_GETARG_INTERVAL_P(0))));
 	dbName=get_database_name(MyDatabaseId);
 	mctx = MemoryContextSwitchTo(TopMemoryContext);
 
@@ -166,8 +173,8 @@ pg_list_orphaned_internal(FunctionCallInfo fcinfo)
 	{
 		OrphanedRelation  *orph = (OrphanedRelation *)lfirst(cell);
 
-		Datum           values[7];
-		bool            nulls[7];
+		Datum           values[8];
+		bool            nulls[8];
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
 
@@ -178,6 +185,11 @@ pg_list_orphaned_internal(FunctionCallInfo fcinfo)
 		values[4] = TimestampTzGetDatum(orph->mod_time);
 		values[5] = Int64GetDatum(orph->relfilenode);
 		values[6] = Int64GetDatum(orph->reloid);
+
+		if (orph->mod_time <= limitts)
+			values[7] = BoolGetDatum(true);
+		else
+			values[7] = BoolGetDatum(false);
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
