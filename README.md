@@ -4,7 +4,13 @@ pg_orphaned
 Features
 --------
 
-Allow to list orphaned files thanks to a *pg_list_orphaned* function.
+Allow to manipulate orphaned files thanks to a few functions:
+
+ * `pg_list_orphaned(interval)`: to list orphaned files. Orphaned files older than the interval parameter (default 1 Day) are listed with the "older" field set to true.
+ * `pg_move_orphaned(interval)`: to move orphaned files to a "orphaned_backup" directory. Only orphaned files older than the interval parameter (default 1 Day) are moved.
+ * `pg_list_orphaned_moved()`: to list the orphaned files that have been moved to the "orphaned_backup" directory.
+ * `pg_move_back_orphaned()`: to move back the orphaned files from the "orphaned_backup" directory to their orginal location (if still orphaned).
+ * `pg_remove_moved_orphaned()`: to remove the orphaned files located in the "orphaned_backup" directory.
 
 Introduction
 ============
@@ -218,12 +224,69 @@ postgres=# select * from pg_list_orphaned('10 seconds');
  postgres | base/13214 | 16388 | 147456 | 2021-10-28 13:19:56+00 |       16388 |      0 | t
 (2 rows)
 ```
+Example 6 (from 11/26/2021):
+----------
+Let's remove the orphaned files that are older than one minute.
+
+* list the orphaned files (older than 1 minute)
+```
+postgres=# select * from pg_list_orphaned('1 minute');
+  dbname  |    path    |   name   |  size   |        mod_time        | relfilenode | reloid | older
+----------+------------+----------+---------+------------------------+-------------+--------+-------
+ postgres | base/13892 | 987654   | 8192000 | 2021-11-26 15:01:46+00 |      987654 |      0 | t
+ postgres | base/13892 | 145676.2 | 8192000 | 2021-11-26 14:54:44+00 |      145676 |      0 | t
+ postgres | base/13892 | 145676   | 8192000 | 2021-11-26 14:54:30+00 |      145676 |      0 | t
+ postgres | base/13892 | 145676.1 | 8192000 | 2021-11-26 14:54:40+00 |      145676 |      0 | t
+(4 rows)
+```
+* move the orphaned files (older than one minute) to the backup directory 
+```
+postgres=# select pg_move_orphaned('1 minute');
+ pg_move_orphaned
+------------------
+                4
+(1 row)
+```
+* list the orphaned files that are in the backup directory
+```
+postgres=# select * from pg_list_orphaned_moved();
+  dbname  |               path               |   name   |  size   |        mod_time        | relfilenode | reloid
+----------+----------------------------------+----------+---------+------------------------+-------------+--------
+ postgres | orphaned_backup/13892/base/13892 | 987654   | 8192000 | 2021-11-26 15:01:46+00 |      987654 |      0
+ postgres | orphaned_backup/13892/base/13892 | 145676.2 | 8192000 | 2021-11-26 14:54:44+00 |      145676 |      0
+ postgres | orphaned_backup/13892/base/13892 | 145676   | 8192000 | 2021-11-26 14:54:30+00 |      145676 |      0
+ postgres | orphaned_backup/13892/base/13892 | 145676.1 | 8192000 | 2021-11-26 14:54:40+00 |      145676 |      0
+(4 rows)
+```
+* remove the orphaned files that have been moved to the backup directory
+```
+postgres=# select pg_remove_moved_orphaned();
+ pg_remove_moved_orphaned
+--------------------------
+
+(1 row)
+```
+* list the orphaned files that are in the backup directory
+```
+postgres=# select * from pg_list_orphaned_moved();
+ dbname | path | name | size | mod_time | relfilenode | reloid
+--------+------+------+------+----------+-------------+--------
+(0 rows)
+```
+* list the orphaned files (older than 1 minute)
+```
+postgres=# select * from pg_list_orphaned('1 minute');
+ dbname | path | name | size | mod_time | relfilenode | reloid | older
+--------+------+------+------+----------+-------------+--------+-------
+(0 rows)
+```
+
 Remarks
 =======
-* double check carefully before taking any actions on those files
+* double check `carefully` before moving or removing the files
 * has been tested from version 10 to 14
-* pg_list_orphaned does the search for the database it is connected to
-* at the time of this writing (08/2021) there is a [commitfest entry](https://commitfest.postgresql.org/34/3228/) to avoid orphaned files
+* the functions deals with orphaned files for the database your are connected to
+* at the time of this writing (11/2021) there is a [commitfest entry](https://commitfest.postgresql.org/34/3228/) to avoid orphaned files
 
 License
 =======
