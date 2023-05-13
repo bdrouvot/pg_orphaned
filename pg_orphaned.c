@@ -52,6 +52,8 @@
 #define NUMBER_SUFFIXES 2
 #define MAX_SUFFIX_SIZE 5
 
+#include "catalog/pg_control.h"
+#include "common/controldata_utils.h"
 
 PG_MODULE_MAGIC;
 Datum pg_list_orphaned(PG_FUNCTION_ARGS);
@@ -73,6 +75,7 @@ static bool made_directory = false;
 static bool found_existing_directory = false;
 char *orphaned_backup_dir= "orphaned_backup";
 static Timestamp limitts;
+TimestampTz last_checkpoint_time;
 
 List   *list_orphaned_relations=NULL;
 static void pg_list_orphaned_internal(FunctionCallInfo fcinfo);
@@ -301,9 +304,26 @@ pg_build_orphaned_list(Oid dbOid, bool restore)
 	char            dir[MAXPGPATH + 21 + sizeof(TABLESPACE_VERSION_DIRECTORY)];
 	Oid                     reltbsnode = InvalidOid;
 	char *reltbsname;
+	ControlFileData *ControlFile;
+	bool        crc_ok;
+	time_t      time_tmp;
 	MemoryContext   mctx;
 
 	dbName=get_database_name(MyDatabaseId);
+
+	/* get a copy of the control file */
+#if PG_VERSION_NUM >= 120000
+	ControlFile = get_controlfile(".", &crc_ok);
+#else
+	ControlFile = get_controlfile(".", NULL, &crc_ok);
+#endif
+	if (!crc_ok)
+		ereport(ERROR,(errmsg("pg_control CRC value is incorrect")));
+
+	/* get last checkpoint time */
+	time_tmp = (time_t) ControlFile->checkPointCopy.time;
+	last_checkpoint_time = time_t_to_timestamptz(time_tmp);
+
 	mctx = MemoryContextSwitchTo(TopMemoryContext);
 
 	list_free_deep(list_orphaned_relations);
@@ -451,6 +471,7 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 	DIR                *dirdesc;
 	struct dirent *de;
 	OrphanedRelation *orph;
+	TimestampTz segment_time;
 
 	dirdesc = AllocateDir(dir);
 	if (!dirdesc)
@@ -487,15 +508,18 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 			oidrel = RelidByRelfilenodeDirty(reltablespace, relfilenode);
 			/*
 			 * Filter and don't report as orphaned
-			 * if first segment and size is zero
+			 * if first segment, size is zero and created after the last checkpoint
 			 * due to https://github.com/postgres/postgres/blob/REL_12_8/src/backend/storage/smgr/md.c#L225
 			 */
-			if (!OidIsValid(oidrel) && !(attrib.st_size == 0 && strstr(de->d_name, ".") == NULL)) {
+			segment_time = time_t_to_timestamptz(attrib.st_mtime);
+			if (!OidIsValid(oidrel) && !(attrib.st_size == 0 &&
+				strstr(de->d_name, ".") == NULL && segment_time > last_checkpoint_time))
+			{
 				orph->dbname = strdup(dbname);
 				orph->path = strdup(dir);
 				orph->name = strdup(de->d_name);
 				orph->size = (int64) attrib.st_size;
-				orph->mod_time = time_t_to_timestamptz(attrib.st_mtime);
+				orph->mod_time = segment_time;
 				orph->relfilenode = relfilenode;
 				orph->reloid = oidrel;
 				*flist = lappend(*flist, orph);
