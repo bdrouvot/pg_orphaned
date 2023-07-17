@@ -907,7 +907,11 @@ RelidByRelfilenodeDirty(Oid reltablespace, Oid relfilenode)
 		/*
 		 * Ok, shared table, check relmapper.
 		 */
+#if PG_VERSION_NUM >= 160000
+		relid = RelationMapFilenumberToOid(relfilenode, true);
+#else
 		relid = RelationMapFilenodeToOid(relfilenode, true);
+#endif
 	}
 	else
 	{
@@ -960,7 +964,11 @@ RelidByRelfilenodeDirty(Oid reltablespace, Oid relfilenode)
 #endif
 		/* check for tables that are mapped but not shared */
 		if (!found)
+#if PG_VERSION_NUM >= 160000
+			relid = RelationMapFilenumberToOid(relfilenode, false);
+#else
 			relid = RelationMapFilenodeToOid(relfilenode, false);
+#endif
 	}
 
 	/*
