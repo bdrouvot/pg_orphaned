@@ -284,7 +284,7 @@ postgres=# select * from pg_list_orphaned('1 minute');
 Remarks
 =======
 * double check `carefully` before moving or removing the files
-* has been tested from version 10 to 14
+* has been tested from version 10 to 16
 * the functions deals with orphaned files for the database your are connected to
 * at the time of this writing (11/2021) there is a [commitfest entry](https://commitfest.postgresql.org/34/3228/) to avoid orphaned files
 
