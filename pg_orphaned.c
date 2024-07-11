@@ -453,7 +453,6 @@ pg_list_orphaned_internal(FunctionCallInfo fcinfo)
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
-	tuplestore_donestoring(tupstore);
 }
 
 /*
