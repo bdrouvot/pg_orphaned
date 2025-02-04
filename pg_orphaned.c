@@ -16,6 +16,8 @@
 #include <sys/stat.h>
 #include "commands/dbcommands.h"
 #include "regex/regex.h"
+#include <time.h>
+#include <utime.h>
 
 #if PG_VERSION_NUM < 100000
 #include <dirent.h>
@@ -87,6 +89,7 @@ static int pg_orphaned_check_dir(const char *dir);
 static void requireSuperuser(void);
 static Oid RelidByRelfilenodeDirty(Oid reltablespace, Oid relfilenode);
 static void InitializeRelfilenodeMapDirty(void);
+static int move_file(char *readFilePath, char *writeFilePath);
 
 /* Hash table for information about each relfilenode <-> oid pair */
 static HTAB *RelfilenodeMapHashDirty = NULL;
@@ -526,7 +529,7 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 				if(strstr(de->d_name, ".") == NULL)
 					pgorph_add_suffix(flist, orph);
 			}
-		/* 
+		/*
 		 * unless is this a temp table?
 		 * temp table format on disk is: t%d_%u
 		 * so that we check it starts with a t
@@ -586,7 +589,7 @@ search_orphaned(List **flist, Oid dboid, const char* dbname, const char* dir, Oi
 								/* _fsm case has already been handled for temp */
 								/* _init would have been too but _init on temp is not possible */
 							}
-						}	
+						}
 					}
 				}
 				pfree(wstr);
@@ -657,10 +660,10 @@ pg_move_orphaned(PG_FUNCTION_ARGS)
         /* If old enough, move the orphaned file and check the success */
         if (orph->mod_time <= limitts)
         {
-            if (rename(orphaned_file, orphaned_file_backup) != 0)
+			if (move_file(orphaned_file, orphaned_file_backup) != 0)
                 ereport(ERROR,
                         (errcode_for_file_access(),
-                        errmsg("could not rename \"%s\" to \"%s\": %m",
+                        errmsg("could not rename or move \"%s\" to \"%s\": %m",
                         orphaned_file, orphaned_file_backup)));
             else
                 nb_moved++;
@@ -738,7 +741,7 @@ pg_move_back_orphaned(PG_FUNCTION_ARGS)
 
 		snprintf(orphaned_file_backup, sizeof(orphaned_file_backup), "%s/%s", orph->path, orph->name);
 
-		/* remove first 2 directories used to locate the backup */	
+		/* remove first 2 directories used to locate the backup */
 		orphaned_file_restore_dup = strdup(orphaned_file_backup);
 		orphaned_file_restore = strchr(orphaned_file_restore_dup, '/');
 
@@ -746,10 +749,10 @@ pg_move_back_orphaned(PG_FUNCTION_ARGS)
 		orphaned_file_restore = strchr(orphaned_file_restore_dup, '/');
 
 		/* move the orphaned files back to their original location */
-		if (rename(orphaned_file_backup, orphaned_file_restore + 1) != 0)
+		if (move_file(orphaned_file_backup, orphaned_file_restore + 1) != 0)
 			ereport(ERROR,
 				(errcode_for_file_access(),
-					errmsg("could not rename \"%s\" to \"%s\": %m",
+					errmsg("could not rename or move \"%s\" to \"%s\": %m",
 						orphaned_file_backup, orphaned_file_restore+1)));
 		else
 			nb_moved++;
@@ -1092,3 +1095,64 @@ InitializeRelfilenodeMapDirty(void)
 	CacheRegisterRelcacheCallback(RelfilenodeMapInvalidateCallbackDirty,
 									(Datum) 0);
 }
+
+/*
+ * Function for copying and remove file after it.
+ * Need for cross-device moving file, because rename function can't it.
+ */
+int move_file(char *readFilePath, char *writeFilePath)
+{
+	FILE *readFile, *writeFile;
+	char buffer;
+	struct utimbuf tmb;
+	struct stat sb;
+	int rename_res;
+
+	/* first try rename for speed, if it got error and error not cross-device renaming when exit with -1 */
+	rename_res = rename(readFilePath, writeFilePath);
+	if (rename_res == 0) {
+		return 0;
+	} else if (errno != EXDEV) {
+		return -1;
+	}
+
+	readFile = fopen(readFilePath, "r");
+
+	if (readFile == NULL) {
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not open source file \"%s\"", readFilePath)));
+	}
+
+	writeFile = fopen(writeFilePath, "wb");
+	if (writeFile == NULL) {
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not open file for write: \"%s\"", writeFilePath)));
+	}
+
+	buffer = fgetc(readFile);
+	while (buffer != EOF) {
+		fputc(buffer, writeFile);
+		buffer = fgetc(readFile);
+	}
+
+	fclose(readFile);
+	fclose(writeFile);
+
+	/* save create and mod timestamp of source file */
+	if (stat(readFilePath, &sb) == -1) {
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not stat file: \"%s\"", readFilePath)));
+	}
+
+	tmb.actime = sb.st_atime;
+	tmb.modtime = sb.st_mtime;
+
+	if (utime(writeFilePath, &tmb) == -1) {
+		ereport(ERROR, (errcode_for_file_access(), errmsg("failed to preserve times for \"%s\"", writeFilePath)));
+	}
+
+	/* remove source file after copying */
+	if (remove(readFilePath) != 0) {
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not remove \"%s\"", readFilePath)));
+	}
+
+	return 0;
+}
+
