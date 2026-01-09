@@ -73,11 +73,11 @@ Datum pg_move_back_orphaned(PG_FUNCTION_ARGS);
 
 static bool made_directory = false;
 static bool found_existing_directory = false;
-char *orphaned_backup_dir= "orphaned_backup";
+static char *orphaned_backup_dir= "orphaned_backup";
 static Timestamp limitts;
-TimestampTz last_checkpoint_time;
+static TimestampTz last_checkpoint_time;
 
-List   *list_orphaned_relations=NULL;
+static List   *list_orphaned_relations=NULL;
 static void pg_list_orphaned_internal(FunctionCallInfo fcinfo);
 static void search_orphaned(List **flist, Oid dboid, const char *dbname, const char *dir, Oid reltablespace);
 static void pg_build_orphaned_list(Oid dbOid, bool restore);
