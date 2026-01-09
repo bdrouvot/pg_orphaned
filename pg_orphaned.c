@@ -87,6 +87,7 @@ static int pg_orphaned_check_dir(const char *dir);
 static void requireSuperuser(void);
 static Oid RelidByRelfilenodeDirty(Oid reltablespace, Oid relfilenode);
 static void InitializeRelfilenodeMapDirty(void);
+static bool is_directory_empty(const char *path);
 
 /* Hash table for information about each relfilenode <-> oid pair */
 static HTAB *RelfilenodeMapHashDirty = NULL;
@@ -686,9 +687,17 @@ pg_remove_moved_orphaned(PG_FUNCTION_ARGS)
 	dbOid = MyDatabaseId;
 
 	dir_to_remove = psprintf("%s/%d", orphaned_backup_dir, dbOid);
-        if (!rmtree(dir_to_remove, true))
-                ereport(WARNING,
-                                (errmsg("could not remove directory \"%s\"", dir_to_remove)));
+
+	if (!rmtree(dir_to_remove, true))
+		ereport(WARNING,
+				(errmsg("could not remove directory \"%s\"", dir_to_remove)));
+
+	/* Now remove the top directory if empty */
+	dir_to_remove = psprintf("%s", orphaned_backup_dir);
+
+	if (is_directory_empty(dir_to_remove) && !rmtree(dir_to_remove, true))
+		ereport(WARNING,
+				(errmsg("could not remove directory \"%s\"", dir_to_remove)));
 
 	PG_RETURN_VOID();
 }
@@ -1091,4 +1100,34 @@ InitializeRelfilenodeMapDirty(void)
 	/* Watch for invalidation events. */
 	CacheRegisterRelcacheCallback(RelfilenodeMapInvalidateCallbackDirty,
 									(Datum) 0);
+}
+
+static bool
+is_directory_empty(const char *path)
+{
+    DIR        *dir;
+    struct dirent *de;
+    bool        is_empty = true;
+
+    dir = AllocateDir(path);
+    if (dir == NULL)
+        ereport(ERROR,
+                (errcode_for_file_access(),
+                 errmsg("could not open directory \"%s\": %m", path)));
+
+    while ((de = ReadDir(dir, path)) != NULL)
+    {
+        /* Skip "." and ".." */
+        if (strcmp(de->d_name, ".") == 0 ||
+            strcmp(de->d_name, "..") == 0)
+            continue;
+
+        /* Found a real entry - directory is not empty */
+        is_empty = false;
+        break;
+    }
+
+    FreeDir(dir);
+
+    return is_empty;
 }
