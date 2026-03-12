@@ -14,7 +14,12 @@
 #include "funcapi.h"
 #include "utils/builtins.h"
 #include <sys/stat.h>
+#if PG_VERSION_NUM < 190000
 #include "commands/dbcommands.h"
+#else
+#include "access/htup_details.h"
+#include "utils/lsyscache.h"
+#endif
 #include "regex/regex.h"
 
 #if PG_VERSION_NUM < 100000
