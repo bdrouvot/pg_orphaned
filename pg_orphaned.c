@@ -14,6 +14,7 @@
 #include "funcapi.h"
 #include "utils/builtins.h"
 #include <sys/stat.h>
+#include <dirent.h>
 #if PG_VERSION_NUM < 190000
 #include "commands/dbcommands.h"
 #else
@@ -21,11 +22,9 @@
 #include "utils/lsyscache.h"
 #endif
 #include "regex/regex.h"
-
-#if PG_VERSION_NUM < 100000
-#include <dirent.h>
 #include "storage/fd.h"
-#endif
+#include "utils/hsearch.h"
+#include "utils/tuplestore.h"
 
 #if PG_VERSION_NUM < 110000
 #include "catalog/pg_collation.h"
